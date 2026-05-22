@@ -1,0 +1,960 @@
+<?php
+
+
+/**
+ * @file
+ * Config-driven agent runner for AI tools.
+ */
+
+/**
+ * Implements hook_config_info().
+ */
+function ai_agents_config_info() {
+  return [
+    'ai_agents.settings' => [
+      'label' => t('AI Agent settings'),
+      'group' => t('AI'),
+    ],
+  ];
+}
+
+/**
+ * Implements hook_permission().
+ */
+function ai_agents_permission() {
+  return [
+    'administer ai agents' => [
+      'title' => t('Administer AI agents'),
+      'description' => t('Create, edit, delete, and run AI agents configs.'),
+    ],
+  ];
+}
+
+/**
+ * Implements hook_menu().
+ */
+function ai_agents_menu() {
+  $items = [];
+
+  $items['admin/config/ai/ai-agents'] = [
+    'title' => 'AI Agents',
+    'description' => 'Manage AI agents configs and run them manually.',
+    'page callback' => 'backdrop_get_form',
+    'page arguments' => ['ai_agents_admin_list_form'],
+    'access arguments' => ['administer ai agents'],
+    'file' => 'includes/ai_agents.admin.inc',
+    'type' => MENU_NORMAL_ITEM,
+  ];
+
+  $items['admin/config/ai/ai-agents/add'] = [
+    'title' => 'Add agent',
+    'page callback' => 'backdrop_get_form',
+    'page arguments' => ['ai_agents_admin_edit_form'],
+    'access arguments' => ['administer ai agents'],
+    'file' => 'includes/ai_agents.admin.inc',
+    'type' => MENU_LOCAL_ACTION,
+  ];
+
+  $items['admin/config/ai/ai-agents/%/edit'] = [
+    'title' => 'Edit agent',
+    'page callback' => 'backdrop_get_form',
+    'page arguments' => ['ai_agents_admin_edit_form', 4],
+    'access arguments' => ['administer ai agents'],
+    'file' => 'includes/ai_agents.admin.inc',
+    'type' => MENU_CALLBACK,
+  ];
+
+  $items['admin/config/ai/ai-agents/%/delete'] = [
+    'title' => 'Delete agent',
+    'page callback' => 'backdrop_get_form',
+    'page arguments' => ['ai_agents_admin_delete_form', 4],
+    'access arguments' => ['administer ai agents'],
+    'file' => 'includes/ai_agents.admin.inc',
+    'type' => MENU_CALLBACK,
+  ];
+
+  $items['admin/config/ai/ai-agents/explorer'] = [
+    'title' => 'Agent Explorer',
+    'description' => 'Run any configured agent interactively and inspect its tool calls and responses.',
+    'page callback' => 'backdrop_get_form',
+    'page arguments' => ['ai_agents_explorer_form'],
+    'access arguments' => ['administer ai agents'],
+    'file' => 'includes/ai_agents.admin.inc',
+    'type' => MENU_LOCAL_ACTION,
+  ];
+
+  return $items;
+}
+
+/**
+ * Implements hook_ai_async_callbacks().
+ */
+function ai_agents_ai_async_callbacks() {
+  return [
+    'ai_agents_async_run' => t('Run an AI agent session in the background.'),
+  ];
+}
+
+/**
+ * Runs an agent loop against the configured tools.
+ *
+ * @param string $agent_id
+ *   Agent machine name.
+ * @param string $message
+ *   User message.
+ * @param array $options
+ *   Optional execution settings.
+ *
+ * @return array|string
+ *   Structured result array, or a job ID string when async mode is used.
+ */
+function ai_agents_run($agent_id, $message, array $options = []) {
+  if (!empty($options['resume_token'])) {
+    return ai_agents_resume_run($agent_id, $options);
+  }
+
+  $agent = ai_agents_load($agent_id);
+  if (empty($agent)) {
+    return [
+      'answer' => '',
+      'loops' => 0,
+      'tool_calls' => [],
+      'error' => "Unknown agent: $agent_id",
+    ];
+  }
+
+  if (!empty($options['async']) && module_exists('ai_async')) {
+    return ai_async_submit('ai_agents_async_run', [
+      'agent_id' => $agent_id,
+      'message' => (string) $message,
+      'options' => $options,
+    ]);
+  }
+
+  $agent['agent_id'] = $agent_id;
+  return ai_agents_run_sync($agent, (string) $message, $options);
+}
+
+/**
+ * Resume a paused agent run after approval.
+ */
+function ai_agents_resume_run($agent_id, array $options = []) {
+  $resume_token = !empty($options['resume_token']) ? (string) $options['resume_token'] : '';
+  if ($resume_token === '') {
+    return [
+      'answer' => '',
+      'loops' => 0,
+      'tool_calls' => [],
+      'error' => 'Missing resume token.',
+    ];
+  }
+
+  $state = ai_agents_load_pending_run($resume_token);
+  if (empty($state)) {
+    return [
+      'answer' => '',
+      'loops' => 0,
+      'tool_calls' => [],
+      'error' => 'Unknown or expired resume token.',
+    ];
+  }
+
+  if (!empty($agent_id) && !empty($state['agent_id']) && $state['agent_id'] !== $agent_id) {
+    return [
+      'answer' => '',
+      'loops' => 0,
+      'tool_calls' => [],
+      'error' => 'Resume token does not match this agent.',
+    ];
+  }
+
+  if (empty($options['approved'])) {
+    return [
+      'answer' => '',
+      'loops' => 0,
+      'tool_calls' => [],
+      'error' => 'Approval not granted.',
+    ];
+  }
+
+  ai_agents_clear_pending_run($resume_token);
+  $api_state = ai_agents_prepare_model_api(isset($state['model']) ? (string) $state['model'] : '');
+  if (!empty($api_state['error'])) {
+    return [
+      'answer' => '',
+      'loops' => 0,
+      'tool_calls' => [],
+      'error' => $api_state['error'],
+    ];
+  }
+  $state['api'] = $api_state['api'];
+  $state['stripped_model'] = $api_state['stripped_model'];
+  $state['approved'] = TRUE;
+
+  return ai_agents_continue_sync($state);
+}
+
+/**
+ * Async callback wrapper.
+ */
+function ai_agents_async_run(array $data) {
+  $agent_id = !empty($data['agent_id']) ? (string) $data['agent_id'] : '';
+  $message = isset($data['message']) ? (string) $data['message'] : '';
+  $options = !empty($data['options']) && is_array($data['options']) ? $data['options'] : [];
+  unset($options['async']);
+
+  return ai_agents_run($agent_id, $message, $options);
+}
+
+/**
+ * Load one agent config.
+ */
+function ai_agents_load($agent_id) {
+  $agents = ai_agents_get_agents();
+  return isset($agents[$agent_id]) && is_array($agents[$agent_id]) ? $agents[$agent_id] : [];
+}
+
+/**
+ * Save agents config.
+ */
+function ai_agents_save_agents(array $agents) {
+  $config = config('ai_agents.settings');
+  $config->setData(['agents' => $agents]);
+  $config->save();
+}
+
+/**
+ * Return all configured agents.
+ */
+function ai_agents_get_agents() {
+  $agents = config_get('ai_agents.settings', 'agents');
+  return is_array($agents) ? $agents : [];
+}
+
+/**
+ * Returns agent options keyed by machine name.
+ */
+function ai_agents_list_agent_options() {
+  $options = [];
+  foreach (ai_agents_get_agents() as $agent_id => $agent) {
+    $options[$agent_id] = !empty($agent['label']) ? $agent['label'] : $agent_id;
+  }
+  return $options;
+}
+
+/**
+ * Merge per-run tool setting overrides into an agent config.
+ */
+function ai_agents_merge_tool_settings_overrides(array $agent, array $overrides = []) {
+  if (empty($overrides)) {
+    return $agent;
+  }
+
+  if (empty($agent['tool_settings']) || !is_array($agent['tool_settings'])) {
+    $agent['tool_settings'] = [];
+  }
+
+  foreach ($overrides as $tool_name => $tool_override) {
+    if (!is_array($tool_override)) {
+      continue;
+    }
+
+    if (empty($agent['tool_settings'][$tool_name]) || !is_array($agent['tool_settings'][$tool_name])) {
+      $agent['tool_settings'][$tool_name] = [];
+    }
+
+    if (isset($tool_override['forced_params']) && is_array($tool_override['forced_params'])) {
+      $existing_forced = !empty($agent['tool_settings'][$tool_name]['forced_params']) && is_array($agent['tool_settings'][$tool_name]['forced_params'])
+        ? $agent['tool_settings'][$tool_name]['forced_params']
+        : [];
+      $agent['tool_settings'][$tool_name]['forced_params'] = array_merge($existing_forced, $tool_override['forced_params']);
+    }
+
+    if (isset($tool_override['hidden_params']) && is_array($tool_override['hidden_params'])) {
+      $existing_hidden = !empty($agent['tool_settings'][$tool_name]['hidden_params']) && is_array($agent['tool_settings'][$tool_name]['hidden_params'])
+        ? $agent['tool_settings'][$tool_name]['hidden_params']
+        : [];
+      $agent['tool_settings'][$tool_name]['hidden_params'] = array_values(array_unique(array_merge($existing_hidden, array_values(array_filter($tool_override['hidden_params'])))));
+    }
+  }
+
+  return $agent;
+}
+
+/**
+ * Delete one agent.
+ */
+function ai_agents_delete($agent_id) {
+  $agents = ai_agents_get_agents();
+  if (!isset($agents[$agent_id])) {
+    return FALSE;
+  }
+  unset($agents[$agent_id]);
+  ai_agents_save_agents($agents);
+  return TRUE;
+}
+
+/**
+ * Run one sync agent loop.
+ */
+function ai_agents_run_sync(array $agent, $message, array $options = []) {
+  $state = ai_agents_create_run_state($agent, $message, $options);
+  if (!empty($state['error'])) {
+    return [
+      'answer' => '',
+      'loops' => 0,
+      'tool_calls' => [],
+      'error' => $state['error'],
+    ];
+  }
+
+  return ai_agents_continue_sync($state);
+}
+
+/**
+ * Build an executable run state.
+ */
+function ai_agents_create_run_state(array $agent, $message, array $options = []) {
+  if (!empty($options['tool_settings_overrides']) && is_array($options['tool_settings_overrides'])) {
+    $agent = ai_agents_merge_tool_settings_overrides($agent, $options['tool_settings_overrides']);
+  }
+
+  $model = !empty($options['model']) ? trim((string) $options['model']) : '';
+  if ($model === '') {
+    $model = !empty($agent['model']) ? trim((string) $agent['model']) : '';
+  }
+  if ($model === '') {
+    $model = ai_agents_default_model();
+  }
+  if ($model === '') {
+    return ['error' => 'No model available.'];
+  }
+
+  $api_state = ai_agents_prepare_model_api($model);
+  if (!empty($api_state['error'])) {
+    return ['error' => $api_state['error']];
+  }
+  $api = $api_state['api'];
+  $stripped_model = $api_state['stripped_model'];
+
+  $tools = ai_agents_build_tool_definitions($agent);
+  if (empty($tools)) {
+    return ['error' => 'No tools enabled for this agent.'];
+  }
+
+  $temperature = isset($agent['temperature']) ? (float) $agent['temperature'] : 0.3;
+  $max_tokens = isset($agent['max_tokens']) ? (int) $agent['max_tokens'] : 1024;
+  $max_loops = isset($agent['max_loops']) ? (int) $agent['max_loops'] : 5;
+  if ($max_loops < 1) {
+    $max_loops = 1;
+  }
+
+  $messages = [];
+  if (!empty($agent['system_prompt'])) {
+    $messages[] = ['role' => 'system', 'content' => (string) $agent['system_prompt']];
+  }
+  $messages[] = ['role' => 'user', 'content' => (string) $message];
+  if (!empty($agent['secured_system_prompt'])) {
+    $messages[] = ['role' => 'system', 'content' => (string) $agent['secured_system_prompt']];
+  }
+
+  return [
+    'agent_id' => !empty($agent['agent_id']) ? (string) $agent['agent_id'] : '',
+    'operation' => !empty($options['operation']) ? (string) $options['operation'] : 'agent_call',
+    'agent' => $agent,
+    'api' => $api,
+    'model' => $model,
+    'stripped_model' => $stripped_model,
+    'temperature' => $temperature,
+    'max_tokens' => $max_tokens,
+    'max_loops' => $max_loops,
+    'messages' => $messages,
+    'trace' => [],
+    'loops' => 0,
+    'tools' => $tools,
+    'approved' => !empty($options['approved']),
+    'pending_tool_calls' => [],
+    'pending_tool' => [],
+  ];
+}
+
+/**
+ * Resolve an API client for one model.
+ */
+function ai_agents_prepare_model_api($model) {
+  $model = trim((string) $model);
+  if ($model === '') {
+    return ['error' => 'No model available.'];
+  }
+
+  $stripped_model = '';
+  $api = ai_get_api_for_model($model, $stripped_model);
+  if (!$api) {
+    return ['error' => "No provider configured for model $model."];
+  }
+
+  return [
+    'api' => $api,
+    'stripped_model' => $stripped_model,
+  ];
+}
+
+/**
+ * Continue a live or resumed run.
+ */
+function ai_agents_continue_sync(array $state) {
+  if (empty($state['api']) || empty($state['tools']) || empty($state['messages'])) {
+    return [
+      'answer' => '',
+      'loops' => 0,
+      'tool_calls' => [],
+      'error' => 'Incomplete agent run state.',
+    ];
+  }
+
+  $trace = !empty($state['trace']) && is_array($state['trace']) ? $state['trace'] : [];
+  $messages = $state['messages'];
+  $loops = !empty($state['loops']) ? (int) $state['loops'] : 0;
+  $max_loops = !empty($state['max_loops']) ? (int) $state['max_loops'] : 1;
+  if ($max_loops < 1) {
+    $max_loops = 1;
+  }
+  $answer = '';
+
+  try {
+    if (!empty($state['pending_tool_calls']) && !empty($state['approved'])) {
+      $pending_tool_result = ai_agents_process_tool_calls($state['agent'], $state['pending_tool_calls'], $trace, $messages, $loops);
+      if (!empty($pending_tool_result['error'])) {
+        return $pending_tool_result;
+      }
+      $trace = $pending_tool_result['trace'];
+      $messages = $pending_tool_result['messages'];
+      $state['pending_tool_calls'] = [];
+      $state['pending_tool'] = [];
+    }
+
+    for ($i = $loops + 1; $i <= $max_loops; $i++) {
+      $loops = $i;
+      $context = [
+        'operation' => !empty($state['operation']) ? $state['operation'] : 'agent_call',
+        'agent_id' => $state['agent_id'],
+      ];
+      $response = $state['api']->chatWithTools($state['stripped_model'], $messages, $state['tools'], $state['temperature'], $state['max_tokens'], 'auto', $context);
+
+      $trace[] = [
+        'loop' => $i,
+        'finish_reason' => $response['finish_reason'],
+        'content' => $response['content'],
+        'tool_calls' => $response['tool_calls'],
+      ];
+
+      if ($response['finish_reason'] !== 'tool_calls' || empty($response['tool_calls'])) {
+        $answer = (string) $response['content'];
+        break;
+      }
+
+      $messages[] = [
+        'role' => 'assistant',
+        'content' => $response['content'],
+        'tool_calls' => ai_agents_normalize_tool_calls($response['tool_calls']),
+      ];
+
+      $pending_tool = ai_agents_get_approval_required_tool($state['agent'], $response['tool_calls']);
+      if (!empty($pending_tool) && empty($state['approved'])) {
+        $state['messages'] = $messages;
+        $state['trace'] = $trace;
+        $state['loops'] = $loops;
+        $state['pending_tool_calls'] = $response['tool_calls'];
+        $state['pending_tool'] = $pending_tool;
+        $token = ai_agents_store_pending_run($state);
+
+        return [
+          'status' => 'needs_approval',
+          'pending_tool' => $pending_tool,
+          'token' => $token,
+          'answer' => '',
+          'loops' => $loops,
+          'tool_calls' => $trace,
+          'error' => NULL,
+        ];
+      }
+
+      $processed_tools = ai_agents_process_tool_calls($state['agent'], $response['tool_calls'], $trace, $messages, $loops);
+      if (!empty($processed_tools['error'])) {
+        return $processed_tools;
+      }
+      $trace = $processed_tools['trace'];
+      $messages = $processed_tools['messages'];
+    }
+  }
+  catch (\Exception $e) {
+    $error_message = $e->getMessage();
+    if (function_exists('ai_exception_user_message')) {
+      $error_message = ai_exception_user_message($e, $error_message);
+    }
+    if (function_exists('ai_exception_context')) {
+      watchdog('ai_agents', 'Agent run failed: @message <pre>@context</pre>', [
+        '@message' => $e->getMessage(),
+        '@context' => check_plain(json_encode(ai_exception_context($e), JSON_PRETTY_PRINT)),
+      ], WATCHDOG_ERROR);
+    }
+    return [
+      'answer' => '',
+      'loops' => $loops,
+      'tool_calls' => $trace,
+      'error' => $error_message,
+    ];
+  }
+
+  return [
+    'answer' => $answer,
+    'loops' => $loops,
+    'tool_calls' => $trace,
+    'error' => NULL,
+  ];
+}
+
+/**
+ * Execute a list of tool calls.
+ */
+function ai_agents_process_tool_calls(array $agent, array $tool_calls, array $trace, array $messages, $loops = 0) {
+  foreach ($tool_calls as $tool_call) {
+    $tool_name = isset($tool_call['name']) ? (string) $tool_call['name'] : '';
+    $tool_args = !empty($tool_call['arguments']) && is_array($tool_call['arguments']) ? $tool_call['arguments'] : [];
+    $tool_result = ai_agents_dispatch_tool($agent, $tool_name, $tool_args);
+
+    if ($tool_result === FALSE) {
+      return [
+        'answer' => '',
+        'loops' => $loops,
+        'tool_calls' => $trace,
+        'error' => "Tool execution blocked by pre-execute hook: $tool_name.",
+      ];
+    }
+
+    $trace[] = [
+      'tool' => $tool_name,
+      'args' => $tool_args,
+      'result' => $tool_result,
+    ];
+
+    $messages[] = [
+      'role' => 'tool',
+      'tool_call_id' => isset($tool_call['id']) ? $tool_call['id'] : '',
+      'content' => $tool_result,
+    ];
+  }
+
+  return [
+    'trace' => $trace,
+    'messages' => $messages,
+    'loops' => $loops,
+  ];
+}
+
+/**
+ * Convert tool calls to AI message shape.
+ */
+function ai_agents_normalize_tool_calls(array $tool_calls) {
+  $normalized = [];
+  foreach ($tool_calls as $tool_call) {
+    $normalized[] = [
+      'id' => isset($tool_call['id']) ? $tool_call['id'] : '',
+      'type' => 'function',
+      'function' => [
+        'name' => isset($tool_call['name']) ? $tool_call['name'] : '',
+        'arguments' => json_encode(isset($tool_call['arguments']) ? $tool_call['arguments'] : []),
+      ],
+    ];
+  }
+  return $normalized;
+}
+
+/**
+ * Build tool definitions from enabled tool keys.
+ */
+function ai_agents_build_tool_definitions(array $agent) {
+  $enabled = !empty($agent['tools']) && is_array($agent['tools']) ? array_values(array_filter($agent['tools'])) : [];
+  if (empty($enabled)) {
+    return [];
+  }
+
+  $all_tools = ai_tools_get_tools();
+  $definitions = [];
+  foreach ($enabled as $tool_key) {
+    if (!isset($all_tools[$tool_key])) {
+      continue;
+    }
+    $tool_settings = ai_agents_get_tool_settings($agent, $tool_key);
+    $definitions[] = ai_agents_constrain_tool_definition($all_tools[$tool_key]['definition'], $tool_settings);
+  }
+
+  return $definitions;
+}
+
+/**
+ * Returns per-tool constraint settings for one agent.
+ */
+function ai_agents_get_tool_settings(array $agent, $tool_name) {
+  if (empty($agent['tool_settings']) || !is_array($agent['tool_settings'])) {
+    return [
+      'forced_params' => [],
+      'hidden_params' => [],
+    ];
+  }
+
+  $tool_settings = isset($agent['tool_settings'][$tool_name]) && is_array($agent['tool_settings'][$tool_name]) ? $agent['tool_settings'][$tool_name] : [];
+
+  return [
+    'forced_params' => !empty($tool_settings['forced_params']) && is_array($tool_settings['forced_params']) ? $tool_settings['forced_params'] : [],
+    'hidden_params' => !empty($tool_settings['hidden_params']) && is_array($tool_settings['hidden_params']) ? array_values(array_filter($tool_settings['hidden_params'])) : [],
+  ];
+}
+
+/**
+ * Removes hidden parameters from a tool definition.
+ */
+function ai_agents_constrain_tool_definition(array $definition, array $tool_settings = []) {
+  $hidden_params = !empty($tool_settings['hidden_params']) && is_array($tool_settings['hidden_params']) ? array_values(array_filter($tool_settings['hidden_params'])) : [];
+  if (empty($hidden_params)) {
+    return $definition;
+  }
+
+  if (!empty($definition['function']['parameters']['properties']) && is_array($definition['function']['parameters']['properties'])) {
+    foreach ($hidden_params as $param_name) {
+      unset($definition['function']['parameters']['properties'][$param_name]);
+    }
+  }
+
+  if (!empty($definition['function']['parameters']['required']) && is_array($definition['function']['parameters']['required'])) {
+    $definition['function']['parameters']['required'] = array_values(array_diff($definition['function']['parameters']['required'], $hidden_params));
+  }
+
+  return $definition;
+}
+
+/**
+ * Applies forced parameters before dispatch.
+ */
+function ai_agents_apply_forced_tool_params(array $tool_args, array $tool_settings = []) {
+  $forced_params = !empty($tool_settings['forced_params']) && is_array($tool_settings['forced_params']) ? $tool_settings['forced_params'] : [];
+  if (empty($forced_params)) {
+    return $tool_args;
+  }
+
+  return array_merge($tool_args, $forced_params);
+}
+
+/**
+ * Invokes pre-execute hooks for one tool call.
+ */
+function ai_agents_invoke_tool_pre_execute($tool_name, array &$tool_args, array $agent) {
+  foreach (module_implements('ai_agents_tool_pre_execute') as $module) {
+    $function = $module . '_ai_agents_tool_pre_execute';
+    if (!function_exists($function)) {
+      continue;
+    }
+
+    $call_args = [$tool_name, &$tool_args, $agent];
+    $result = call_user_func_array($function, $call_args);
+    if ($result === FALSE) {
+      return FALSE;
+    }
+  }
+
+  return TRUE;
+}
+
+/**
+ * Dispatches a tool with agent-specific constraints applied.
+ */
+function ai_agents_dispatch_tool(array $agent, $tool_name, array $tool_args) {
+  $settings = ai_agents_get_tool_settings($agent, $tool_name);
+  $tool_args = ai_agents_apply_forced_tool_params($tool_args, $settings);
+  if (ai_agents_invoke_tool_pre_execute($tool_name, $tool_args, $agent) === FALSE) {
+    return FALSE;
+  }
+  $tool_args = ai_agents_apply_forced_tool_params($tool_args, $settings);
+  return ai_tools_dispatch($tool_name, $tool_args);
+}
+
+/**
+ * Determines whether a tool requires approval.
+ */
+function ai_agents_tool_requires_approval(array $tool) {
+  $operation = !empty($tool['operation']) ? (string) $tool['operation'] : 'read';
+  if (in_array($operation, ['write', 'trigger'], TRUE)) {
+    return TRUE;
+  }
+
+  return !empty($tool['destructive']);
+}
+
+/**
+ * Returns one approval-requiring tool call from a list of tool calls.
+ */
+function ai_agents_get_approval_required_tool(array $agent, array $tool_calls) {
+  $all_tools = ai_tools_get_tools();
+  foreach ($tool_calls as $tool_call) {
+    $tool_name = isset($tool_call['name']) ? (string) $tool_call['name'] : '';
+    if (empty($tool_name) || empty($all_tools[$tool_name])) {
+      continue;
+    }
+    if (ai_agents_tool_requires_approval($all_tools[$tool_name])) {
+      return [
+        'name' => $tool_name,
+        'args' => !empty($tool_call['arguments']) && is_array($tool_call['arguments']) ? $tool_call['arguments'] : [],
+      ];
+    }
+  }
+
+  return [];
+}
+
+/**
+ * Store a paused run in cache.
+ */
+function ai_agents_store_pending_run(array $state) {
+  $token = backdrop_random_key(16);
+  $cache_state = $state;
+  unset($cache_state['api']);
+  $cache_state['resume_token'] = $token;
+  db_merge('ai_agents_pending_run')
+    ->key(['token' => $token])
+    ->fields([
+      'agent_id' => !empty($cache_state['agent_id']) ? (string) $cache_state['agent_id'] : '',
+      'state' => serialize($cache_state),
+      'created' => REQUEST_TIME,
+      'updated' => REQUEST_TIME,
+    ])
+    ->execute();
+  return $token;
+}
+
+/**
+ * Load a paused run from cache.
+ */
+function ai_agents_load_pending_run($token) {
+  $record = db_query("SELECT state FROM {ai_agents_pending_run} WHERE token = :token", [':token' => $token])->fetchField();
+  if ($record === FALSE || $record === NULL || $record === '') {
+    return [];
+  }
+  $state = @unserialize($record);
+  return is_array($state) ? $state : [];
+}
+
+/**
+ * Clear a paused run from cache.
+ */
+function ai_agents_clear_pending_run($token) {
+  db_delete('ai_agents_pending_run')
+    ->condition('token', $token)
+    ->execute();
+}
+
+/**
+ * Resolve a default model.
+ */
+function ai_agents_default_model() {
+  $configured = trim((string) config_get('ai.settings', 'default_text_model'));
+  if ($configured !== '') {
+    return $configured;
+  }
+
+  $models = function_exists('ai_get_all_chat_models') ? ai_get_all_chat_models() : [];
+  foreach ($models as $group) {
+    if (!is_array($group) || empty($group)) {
+      continue;
+    }
+    reset($group);
+    return key($group);
+  }
+
+  return '';
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6: Orchestration — agents as tools
+// ---------------------------------------------------------------------------
+
+/**
+ * Implements hook_ai_tools().
+ *
+ * Registers each configured agent as an ai_tools tool so orchestrator
+ * agents can call sub-agents via the standard tool dispatch mechanism.
+ */
+function ai_agents_ai_tools() {
+  if (!module_exists('ai_tools')) {
+    return [];
+  }
+
+  $tools = [];
+  foreach (ai_agents_get_agents() as $agent_id => $agent) {
+    $label       = !empty($agent['label'])       ? $agent['label']       : $agent_id;
+    $description = !empty($agent['description']) ? $agent['description'] : "Run the {$label} agent.";
+    if ($agent_id === 'content_type_agent') {
+      $description .= ' For requests that create a content type and add fields, run this first, then verify the bundle exists before any field agent work.';
+    }
+    elseif ($agent_id === 'field_agent') {
+      $description .= ' Depends on the content type already existing. If the request also creates the content type, run content_type_agent first and verify the bundle before this agent attaches fields.';
+    }
+    $tool_name   = 'agent_' . preg_replace('/[^a-z0-9_]/', '_', strtolower($agent_id));
+
+    $tools[$tool_name] = [
+      'definition' => [
+        'type'     => 'function',
+        'function' => [
+          'name'        => $tool_name,
+          'description' => $description,
+          'parameters'  => [
+            'type'       => 'object',
+            'properties' => [
+              'message' => [
+                'type'        => 'string',
+                'description' => 'The task or question to send to the agent.',
+              ],
+            ],
+            'required' => ['message'],
+          ],
+        ],
+      ],
+      'execute'     => '_ai_agents_as_tool_executor',
+      'execute_args' => ['agent_id' => $agent_id],
+      'operation'   => 'read',
+      'destructive' => FALSE,
+      'permission'  => 'administer ai agents',
+    ];
+  }
+
+  return $tools;
+}
+
+/**
+ * Executor for agent-as-tool calls.
+ *
+ * @param array $args
+ *   Tool arguments: 'message' (string) + '_agent_id' injected by dispatch.
+ *
+ * @return string
+ *   The agent's answer, or an error string.
+ */
+function _ai_agents_as_tool_executor(array $args) {
+  $message  = trim((string) ($args['message'] ?? ''));
+  $agent_id = (string) ($args['_agent_id'] ?? '');
+
+  if ($agent_id === '' || $message === '') {
+    return json_encode(['error' => 'agent_id and message are required.']);
+  }
+
+  $result = ai_agents_run($agent_id, $message);
+
+  if (!empty($result['error'])) {
+    return json_encode(['error' => $result['error']]);
+  }
+
+  return (string) ($result['answer'] ?? '');
+}
+
+/**
+ * Implements hook_ai_assistants_agent_orchestration_callbacks().
+ *
+ * Registers the produces/consumes callbacks for the three Backdrop core
+ * agents shipped in ai_agents.settings.json. Sites running a custom agent
+ * set can override these by implementing the same hook in their own module
+ * (and disabling these defaults via hook_ai_assistants_agent_orchestration_callbacks_alter).
+ */
+function ai_agents_ai_assistants_agent_orchestration_callbacks() {
+  return [
+    'content_type_agent' => [
+      'produces' => [
+        'content_type' => 'ai_agents_extract_created_content_type',
+      ],
+    ],
+    'field_agent' => [
+      'consumes' => [
+        'content_type' => 'ai_agents_inject_content_type_context',
+      ],
+      'produces' => [
+        'created_field_storage_type' => 'ai_agents_extract_created_field_storage_type',
+      ],
+    ],
+  ];
+}
+
+/**
+ * Extract the content type machine name from a content_type_agent result.
+ *
+ * Reads the tool_calls trace for a create_content_type call and returns the
+ * `type` argument actually submitted — more reliable than regex on user input.
+ *
+ * @param array $result
+ *   A normalized agent result array (the structure produced by
+ *   ai_assistants_run_backing_agent).
+ *
+ * @return string
+ *   The content type machine name, or empty string when no
+ *   create_content_type call was made.
+ */
+function ai_agents_extract_created_content_type(array $result) {
+  $trace = !empty($result['tool_calls']) && is_array($result['tool_calls']) ? $result['tool_calls'] : [];
+  foreach ($trace as $entry) {
+    if (empty($entry['tool_calls']) || !is_array($entry['tool_calls'])) {
+      continue;
+    }
+    foreach ($entry['tool_calls'] as $tool_call) {
+      if (!empty($tool_call['name']) && $tool_call['name'] === 'create_content_type') {
+        $args = !empty($tool_call['arguments']) && is_array($tool_call['arguments']) ? $tool_call['arguments'] : [];
+        if (!empty($args['type']) && is_string($args['type'])) {
+          return (string) $args['type'];
+        }
+      }
+    }
+  }
+  return '';
+}
+
+/**
+ * Extract the field storage type from a field_agent result.
+ *
+ * Reads the tool_calls trace for a create_field_storage call and returns the
+ * `field_type` argument actually used.
+ */
+function ai_agents_extract_created_field_storage_type(array $result) {
+  $trace = !empty($result['tool_calls']) && is_array($result['tool_calls']) ? $result['tool_calls'] : [];
+  foreach ($trace as $entry) {
+    if (empty($entry['tool_calls']) || !is_array($entry['tool_calls'])) {
+      continue;
+    }
+    foreach ($entry['tool_calls'] as $tool_call) {
+      if (!empty($tool_call['name']) && $tool_call['name'] === 'create_field_storage') {
+        $args = !empty($tool_call['arguments']) && is_array($tool_call['arguments']) ? $tool_call['arguments'] : [];
+        if (!empty($args['field_type']) && is_string($args['field_type'])) {
+          return (string) $args['field_type'];
+        }
+      }
+    }
+  }
+  return '';
+}
+
+/**
+ * Inject a verified content type machine name into an agent runtime message.
+ *
+ * Used as a consume callback so field_agent can be told which bundle to
+ * attach fields to without parsing the user's natural-language phrasing.
+ *
+ * @param string $runtime_message
+ *   The runtime message that will be sent to the agent.
+ * @param mixed $content_type
+ *   The content type machine name produced by an upstream agent.
+ *
+ * @return string
+ *   The runtime message with the content type context appended.
+ */
+function ai_agents_inject_content_type_context($runtime_message, $content_type) {
+  $content_type = is_string($content_type) ? trim($content_type) : '';
+  if ($content_type === '') {
+    return $runtime_message;
+  }
+  return $runtime_message . "\n\nVERIFIED_CONTENT_TYPE_FOR_FIELD_WORK:\nUse content_type \"" . $content_type . "\" for every field instance in this request. Do not attach these fields to any other content type such as post or page.";
+}

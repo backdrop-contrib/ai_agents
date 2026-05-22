@@ -1,0 +1,90 @@
+<?php
+
+/**
+ * @file
+ * Tests for Phase 6: agent-as-tool orchestration.
+ */
+
+class AIAgentOrchestrationTestCase extends BackdropWebTestCase {
+
+  public function setUp() {
+    parent::setUp(['ai', 'ai_tools', 'ai_agents', 'ai_agents_test']);
+
+    $providers = config('ai.settings');
+    $providers->set('providers', [
+      'agent_test' => ['enabled' => 1],
+    ]);
+    $providers->save();
+
+    ai_agents_save_agents([
+      'sub_agent' => [
+        'label'                 => 'Sub Agent',
+        'description'           => 'A sub-agent for orchestration tests.',
+        'system_prompt'         => 'You are a sub-agent.',
+        'secured_system_prompt' => 'Return exact final answer only.',
+        'model'                 => 'agent_test/gpt-4o-mini',
+        'temperature'           => 0.0,
+        'max_tokens'            => 128,
+        'max_loops'             => 3,
+        'tools'                 => ['test_echo_message'],
+      ],
+    ]);
+  }
+
+  /**
+   * Each configured agent appears in ai_tools registry as agent_<id>.
+   */
+  public function testAgentsRegisteredAsTools() {
+    $tools = ai_tools_get_tools();
+    $this->assertTrue(isset($tools['agent_sub_agent']), 'agent_sub_agent tool is registered in ai_tools.');
+  }
+
+  /**
+   * Registered agent tool has correct MCP-compatible definition.
+   */
+  public function testAgentToolDefinitionShape() {
+    $tools = ai_tools_get_tools();
+    $this->assertTrue(isset($tools['agent_sub_agent']), 'Tool exists.');
+    $fn = $tools['agent_sub_agent']['definition']['function'];
+    $this->assertEqual('agent_sub_agent', $fn['name'], 'Tool function name matches key.');
+    $this->assertTrue(!empty($fn['description']), 'Tool has a description.');
+    $this->assertTrue(isset($fn['parameters']['properties']['message']), 'Tool has message parameter.');
+    $this->assertEqual(['message'], $fn['parameters']['required'], 'message is required.');
+  }
+
+  /**
+   * Dispatching agent_sub_agent tool runs the sub-agent and returns its answer.
+   */
+  public function testDispatchAgentTool() {
+    $result = ai_tools_dispatch('agent_sub_agent', ['message' => 'Hello sub-agent']);
+    $this->assertTrue(is_string($result), 'Dispatch returned a string.');
+    $this->assertTrue(strlen($result) > 0, 'Result is non-empty.');
+  }
+
+  /**
+   * execute_args injection: _agent_id arrives at executor via dispatch.
+   */
+  public function testExecuteArgsInjected() {
+    $tools = ai_tools_get_tools();
+    $this->assertTrue(isset($tools['agent_sub_agent']['execute_args']['agent_id']), 'execute_args carries agent_id.');
+    $this->assertEqual('sub_agent', $tools['agent_sub_agent']['execute_args']['agent_id'], 'agent_id is the correct machine name.');
+  }
+
+  /**
+   * Executor returns error JSON when called with missing agent_id.
+   */
+  public function testExecutorErrorOnMissingAgentId() {
+    $result = _ai_agents_as_tool_executor(['message' => 'hello']);
+    $data   = json_decode($result, TRUE);
+    $this->assertTrue(!empty($data['error']), 'Executor returns error when _agent_id is missing.');
+  }
+
+  /**
+   * Executor returns error JSON when message is empty.
+   */
+  public function testExecutorErrorOnEmptyMessage() {
+    $result = _ai_agents_as_tool_executor(['_agent_id' => 'sub_agent', 'message' => '']);
+    $data   = json_decode($result, TRUE);
+    $this->assertTrue(!empty($data['error']), 'Executor returns error when message is empty.');
+  }
+}

@@ -1,0 +1,128 @@
+<?php
+
+/**
+ * @file
+ * Install and update functions for AI Agent.
+ */
+
+/**
+ * Implements hook_schema().
+ */
+function ai_agents_schema() {
+  $schema = array();
+
+  $schema['ai_agents_pending_run'] = array(
+    'description' => 'Stores paused approval-required agent runs.',
+    'fields' => array(
+      'token' => array(
+        'description' => 'Resume token for the paused run.',
+        'type' => 'varchar',
+        'length' => 64,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'agent_id' => array(
+        'description' => 'Agent machine name for this paused run.',
+        'type' => 'varchar',
+        'length' => 128,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'state' => array(
+        'description' => 'Serialized paused run state.',
+        'type' => 'text',
+        'size' => 'big',
+        'not null' => TRUE,
+      ),
+      'created' => array(
+        'description' => 'Unix timestamp when the run was paused.',
+        'type' => 'int',
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'updated' => array(
+        'description' => 'Unix timestamp when the run was last updated.',
+        'type' => 'int',
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+    ),
+    'primary key' => array('token'),
+    'indexes' => array(
+      'agent_id' => array('agent_id'),
+      'updated' => array('updated'),
+    ),
+  );
+
+  return $schema;
+}
+
+/**
+ * Implements hook_install().
+ */
+function ai_agents_install() {
+  // Import default agent definitions shipped with the module.
+  // Do this before the upgrade migration so defaults are present even on fresh installs.
+  config_install_default_config('module', 'ai_agents');
+
+  if (!module_load_install('ai_upgrade')) { return; }
+  ai_upgrade_module_install('ai_agent');
+}
+
+/**
+ * Create persistent storage for paused approval-required runs.
+ */
+function ai_agents_update_1000() {
+  $schema = ai_agents_schema();
+  if (!db_table_exists('ai_agents_pending_run')) {
+    db_create_table('ai_agents_pending_run', $schema['ai_agents_pending_run']);
+  }
+}
+
+/**
+ * Rename openai_agents_pending_run table to ai_agents_pending_run.
+ */
+function ai_agents_update_1001() {
+  if (db_table_exists('openai_agents_pending_run') && !db_table_exists('ai_agents_pending_run')) {
+    db_rename_table('openai_agents_pending_run', 'ai_agents_pending_run');
+  }
+  elseif (db_table_exists('openai_agents_pending_run')) {
+    db_drop_table('openai_agents_pending_run');
+  }
+  return t('Renamed openai_agents_pending_run to ai_agents_pending_run.');
+}
+
+/**
+ * Import default agent definitions shipped with the module.
+ */
+function ai_agents_update_1003() {
+  $config = config('ai_agents.settings');
+  $existing = $config->get('agents');
+  $module_path = backdrop_get_path('module', 'ai_agents');
+  $defaults = json_decode(file_get_contents($module_path . '/config/ai_agents.settings.json'), TRUE);
+  $default_agents = isset($defaults['agents']) ? $defaults['agents'] : [];
+
+  // Merge default agents in — existing customized agents are preserved.
+  $merged = array_merge($default_agents, is_array($existing) ? $existing : []);
+  $config->set('agents', $merged)->save();
+  return t('Imported @count default agent definitions.', ['@count' => count($default_agents)]);
+}
+
+/**
+ * Re-migrate openai_agent.settings → ai_agents.settings stripping openai/ prefix.
+ */
+function ai_agents_update_1002() {
+  if (!module_load_install('ai_upgrade')) { return []; }
+  if (function_exists('_ai_transform_agent_config')) {
+    _ai_migrate_config_object('openai_agent.settings', 'ai_agents.settings', '_ai_transform_agent_config', TRUE);
+  }
+  return t('Re-migrated agent config: stripped openai/ provider prefix from model fields.');
+}
+
+/**
+ * Implements hook_requirements().
+ */
+function ai_agents_requirements($phase) {
+  if (!module_load_install('ai_upgrade')) { return []; }
+  return ai_upgrade_module_requirements($phase, 'ai_agent');
+}

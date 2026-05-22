@@ -1,0 +1,68 @@
+<?php
+
+/**
+ * @file
+ * Tests for AI agent tool constraints.
+ */
+
+class AIAgentConstraintTestCase extends BackdropWebTestCase {
+
+  public function setUp() {
+    parent::setUp(['ai', 'ai_tools', 'ai_agents', 'ai_agents_test']);
+
+    $providers = config('ai.settings');
+    $providers->set('providers', [
+      'agent_test' => [
+        'enabled' => 1,
+      ],
+    ]);
+    $providers->save();
+
+    ai_agents_save_agents([
+      'constraint_agent' => [
+        'label' => 'Constraint Agent',
+        'description' => 'Deterministic agent for tool constraint coverage.',
+        'system_prompt' => 'You are a constraint test agent.',
+        'secured_system_prompt' => 'Return exact final answer only.',
+        'model' => 'agent_test/gpt-4o-mini',
+        'temperature' => 0.0,
+        'max_tokens' => 128,
+        'max_loops' => 3,
+        'tools' => ['test_controlled_message'],
+        'tool_settings' => [
+          'test_controlled_message' => [
+            'forced_params' => [
+              'channel' => '#content-team',
+            ],
+            'hidden_params' => [
+              'channel',
+            ],
+          ],
+        ],
+      ],
+    ]);
+  }
+
+  public function testHiddenParamsRemovedFromToolSchema() {
+    $agent = ai_agents_load('constraint_agent');
+    $definitions = ai_agents_build_tool_definitions($agent);
+
+    $this->assertEqual(1, count($definitions), 'One tool definition returned.');
+    $function = $definitions[0]['function'];
+    $properties = isset($function['parameters']['properties']) ? $function['parameters']['properties'] : [];
+    $required = isset($function['parameters']['required']) ? $function['parameters']['required'] : [];
+
+    $this->assertFalse(isset($properties['channel']), 'Hidden parameter removed from tool schema.');
+    $this->assertTrue(isset($properties['message']), 'Visible parameter remains in tool schema.');
+    $this->assertFalse(in_array('channel', $required, TRUE), 'Hidden parameter removed from required list.');
+  }
+
+  public function testForcedParamsAppliedAtDispatch() {
+    AITestSupportAdapter::$chatWithToolsCalls = [];
+
+    $result = ai_agents_run('constraint_agent', 'Hello constraints');
+
+    $this->assertTrue(empty($result['error']), 'Agent run finished without error.');
+    $this->assertEqual('Final answer: {"channel":"#content-team","message":"Hooked: Hello constraints"}', $result['answer'], 'Forced tool parameter overrode model-supplied value and hook adjusted the message.');
+  }
+}

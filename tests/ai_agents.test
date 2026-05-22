@@ -1,0 +1,51 @@
+<?php
+
+/**
+ * @file
+ * Tests for AI Agent runner.
+ */
+
+class AIAgentRunnerTestCase extends BackdropWebTestCase {
+
+  public function setUp() {
+    parent::setUp(['ai', 'ai_tools', 'ai_agents', 'ai_agents_test']);
+
+    $providers = config('ai.settings');
+    $providers->set('providers', [
+      'agent_test' => [
+        'enabled' => 1,
+      ],
+    ]);
+    $providers->save();
+
+    ai_agents_save_agents([
+      'test_agent' => [
+        'label' => 'Test Agent',
+        'description' => 'Deterministic agent for test coverage.',
+        'system_prompt' => 'You are a test agent.',
+        'secured_system_prompt' => 'Return exact final answer only.',
+        'model' => 'agent_test/gpt-4o-mini',
+        'temperature' => 0.0,
+        'max_tokens' => 128,
+        'max_loops' => 3,
+        'tools' => ['test_echo_message'],
+      ],
+    ]);
+  }
+
+  public function testAgentRunnerUsesToolLoop() {
+    $result = ai_agents_run('test_agent', 'Hello agent');
+    $this->assertTrue(empty($result['error']), 'Agent run finished without error.');
+    $this->assertTrue($result['loops'] >= 2, 'Agent loop ran through tool call and final answer.');
+    $this->assertEqual('Final answer: {"echo":"Hello agent"}', $result['answer'], 'Agent returned deterministic final answer.');
+  }
+
+  public function testAgentPromptOrder() {
+    AITestSupportAdapter::$chatWithToolsCalls = [];
+    ai_agents_run('test_agent', 'Check prompt order');
+    $messages = !empty(AITestSupportAdapter::$chatWithToolsCalls) ? AITestSupportAdapter::$chatWithToolsCalls[0]['messages'] : [];
+    $this->assertEqual('system', $messages[0]['role'], 'First message is system prompt.');
+    $this->assertEqual('user', $messages[1]['role'], 'User prompt comes before secured prompt.');
+    $this->assertEqual('system', $messages[2]['role'], 'Secured prompt is injected after user message.');
+  }
+}

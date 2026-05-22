@@ -1,0 +1,25 @@
+[AIAgentRunnerTestCase]
+name = AI Agents Runner Test
+description = Verify agent loop runner and prompt ordering.
+group = AI
+file = tests/ai_agents.test
+
+[AIAgentConstraintTestCase]
+name = AI Agents Constraint Test
+description = Verify hidden and forced tool parameters.
+group = AI
+file = tests/ai_agents_constraints.test
+
+[AIAgentApprovalTestCase]
+name = AI Agents Approval Test
+description = Verify approval pause and resume behavior.
+group = AI
+file = tests/ai_agents_approval.test
+
+[AIAgentOrchestrationTestCase]
+name = AI Agents Orchestration Test
+description = Verify Phase 6: agents self-register as ai_tools tools and dispatch correctly.
+group = AI
+file = tests/ai_agents_orchestration.test
+
+; Added by Codex for test coverage.

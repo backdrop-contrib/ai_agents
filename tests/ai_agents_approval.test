@@ -1,0 +1,64 @@
+<?php
+
+/**
+ * @file
+ * Tests for AI agent approval flow.
+ */
+
+class AIAgentApprovalTestCase extends BackdropWebTestCase {
+
+  public function setUp() {
+    parent::setUp(['ai', 'ai_tools', 'ai_agents', 'ai_agents_test']);
+
+    $providers = config('ai.settings');
+    $providers->set('providers', [
+      'agent_test' => [
+        'enabled' => 1,
+      ],
+    ]);
+    $providers->save();
+
+    ai_agents_save_agents([
+      'approval_agent' => [
+        'label' => 'Approval Agent',
+        'description' => 'Deterministic agent for approval coverage.',
+        'system_prompt' => 'You are an approval test agent.',
+        'secured_system_prompt' => 'Return exact final answer only.',
+        'model' => 'agent_test/gpt-4o-mini',
+        'temperature' => 0.0,
+        'max_tokens' => 128,
+        'max_loops' => 3,
+        'tools' => ['test_write_message'],
+        'tool_settings' => [
+          'test_write_message' => [
+            'forced_params' => [
+              'channel' => '#content-team',
+            ],
+            'hidden_params' => [
+              'channel',
+            ],
+          ],
+        ],
+      ],
+    ]);
+  }
+
+  public function testApprovalPauseAndResume() {
+    AITestSupportAdapter::$chatWithToolsCalls = [];
+
+    $result = ai_agents_run('approval_agent', 'Hello approval');
+
+    $this->assertEqual('needs_approval', $result['status'], 'Agent paused for approval.');
+    $this->assertTrue(!empty($result['token']), 'Resume token returned.');
+    $this->assertEqual('test_write_message', $result['pending_tool']['name'], 'Pending tool identified.');
+    $this->assertTrue(empty($result['error']), 'Pause returned without error.');
+
+    $resume = ai_agents_run('approval_agent', NULL, [
+      'resume_token' => $result['token'],
+      'approved' => TRUE,
+    ]);
+
+    $this->assertTrue(empty($resume['error']), 'Resumed run finished without error.');
+    $this->assertEqual('Final answer: {"channel":"#content-team","message":"Approved: Hello approval"}', $resume['answer'], 'Approved tool resumed with forced params and hook mutation.');
+  }
+}

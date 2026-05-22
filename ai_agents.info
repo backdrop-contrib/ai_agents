@@ -1,0 +1,8 @@
+name = AI Agents
+description = Config-driven agent runner for AI tools and chatWithTools loops.
+backdrop = 1.x
+type = module
+package = AI
+dependencies[] = ai
+dependencies[] = ai_tools
+configure = admin/config/ai/ai-agents
