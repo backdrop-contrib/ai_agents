@@ -459,18 +459,21 @@ function ai_agents_continue_sync(array $state) {
         'tool_calls' => ai_agents_normalize_tool_calls($response['tool_calls']),
       ];
 
-      $pending_tool = ai_agents_get_approval_required_tool($state['agent'], $response['tool_calls']);
-      if (!empty($pending_tool) && empty($state['approved'])) {
+      $pending_tools = ai_agents_get_approval_required_tools($state['agent'], $response['tool_calls']);
+      if (!empty($pending_tools) && empty($state['approved'])) {
         $state['messages'] = $messages;
         $state['trace'] = $trace;
         $state['loops'] = $loops;
         $state['pending_tool_calls'] = $response['tool_calls'];
-        $state['pending_tool'] = $pending_tool;
+        $state['pending_tool'] = $pending_tools[0];
+        $state['pending_tools'] = $pending_tools;
         $token = ai_agents_store_pending_run($state);
 
         return [
           'status' => 'needs_approval',
-          'pending_tool' => $pending_tool,
+          // BC single-tool shape; 'pending_tools' carries the full batch.
+          'pending_tool' => $pending_tools[0],
+          'pending_tools' => $pending_tools,
           'token' => $token,
           'answer' => '',
           'loops' => $loops,
@@ -692,23 +695,53 @@ function ai_agents_tool_requires_approval(array $tool) {
 
 /**
  * Returns one approval-requiring tool call from a list of tool calls.
+ *
+ * Kept for backward compatibility; approval messaging should use
+ * ai_agents_get_approval_required_tools() so the user sees every tool the
+ * approval will execute, not just the first.
  */
 function ai_agents_get_approval_required_tool(array $agent, array $tool_calls) {
+  $pending = ai_agents_get_approval_required_tools($agent, $tool_calls);
+  return !empty($pending) ? $pending[0] : [];
+}
+
+/**
+ * Returns every approval-requiring tool call from a list of tool calls.
+ *
+ * Approval is granted per batch — all tool calls in the paused loop
+ * iteration execute on resume — so the user must be shown all of them.
+ */
+function ai_agents_get_approval_required_tools(array $agent, array $tool_calls) {
   $all_tools = ai_tools_get_tools();
+  $pending = [];
   foreach ($tool_calls as $tool_call) {
     $tool_name = isset($tool_call['name']) ? (string) $tool_call['name'] : '';
     if (empty($tool_name) || empty($all_tools[$tool_name])) {
       continue;
     }
     if (ai_agents_tool_requires_approval($all_tools[$tool_name])) {
-      return [
+      $pending[] = [
         'name' => $tool_name,
         'args' => !empty($tool_call['arguments']) && is_array($tool_call['arguments']) ? $tool_call['arguments'] : [],
       ];
     }
   }
 
-  return [];
+  return $pending;
+}
+
+/**
+ * Returns a human-readable summary of pending approval tool names.
+ */
+function ai_agents_pending_tools_summary(array $pending_tools, $fallback = '') {
+  $names = [];
+  foreach ($pending_tools as $tool) {
+    if (!empty($tool['name'])) {
+      $names[] = (string) $tool['name'];
+    }
+  }
+  $names = array_values(array_unique($names));
+  return !empty($names) ? implode(', ', $names) : (string) $fallback;
 }
 
 /**
@@ -732,15 +765,36 @@ function ai_agents_store_pending_run(array $state) {
 }
 
 /**
+ * Maximum age in seconds for a paused approval run before it expires.
+ */
+define('AI_AGENTS_PENDING_RUN_TTL', 259200);
+
+/**
  * Load a paused run from cache.
  */
 function ai_agents_load_pending_run($token) {
-  $record = db_query("SELECT state FROM {ai_agents_pending_run} WHERE token = :token", [':token' => $token])->fetchField();
+  $record = db_query("SELECT state FROM {ai_agents_pending_run} WHERE token = :token AND updated >= :min_updated", [
+    ':token' => $token,
+    ':min_updated' => REQUEST_TIME - AI_AGENTS_PENDING_RUN_TTL,
+  ])->fetchField();
   if ($record === FALSE || $record === NULL || $record === '') {
     return [];
   }
-  $state = @unserialize($record);
+  // State is plain arrays; never instantiate objects from stored data.
+  $state = @unserialize($record, ['allowed_classes' => FALSE]);
   return is_array($state) ? $state : [];
+}
+
+/**
+ * Implements hook_cron().
+ *
+ * Purges expired paused runs so stale approval tokens cannot accumulate
+ * or be resumed long after the fact.
+ */
+function ai_agents_cron() {
+  db_delete('ai_agents_pending_run')
+    ->condition('updated', REQUEST_TIME - AI_AGENTS_PENDING_RUN_TTL, '<')
+    ->execute();
 }
 
 /**
