@@ -27,6 +27,14 @@ function ai_agents_bee_command() {
       'message' => bt('Optional. One-shot prompt. If omitted, an interactive session starts.'),
     ],
     'optional_arguments' => ['agent_id', 'message'],
+    'options' => [
+      'resume-token' => [
+        'description' => bt('Resume token from a paused approval-required run.'),
+      ],
+      'approved' => [
+        'description' => bt('Set to 1 to approve the paused tool call when resuming.'),
+      ],
+    ],
     'callback' => 'bee_ai_agents_run',
   ];
 
@@ -62,6 +70,21 @@ function bee_ai_agents_list() {
 function bee_ai_agents_run($arguments = [], $options = []) {
   $agent_id = !empty($arguments['agent_id']) ? (string) $arguments['agent_id'] : '';
   $message = array_key_exists('message', $arguments) ? (string) $arguments['message'] : '';
+
+  // Map hyphenated bee options to the keys ai_agents_run() expects.
+  if (!empty($options['resume-token'])) {
+    $resume_options = [];
+    $resume_options['resume_token'] = (string) $options['resume-token'];
+    // Strictly compare so string 'false' or '0' are not treated as approved.
+    $approved_raw = $options['approved'] ?? FALSE;
+    $resume_options['approved'] = ($approved_raw === TRUE || $approved_raw === 1 || $approved_raw === '1');
+    // Resuming needs no message; don't fall into the interactive loop.
+    bee_ai_agents_print_run_result($agent_id, '', $resume_options);
+    return;
+  }
+
+  // Strip resume-only flags so fresh runs never inherit them.
+  unset($options['resume-token'], $options['resume_token'], $options['approved']);
 
   if ($agent_id === '') {
     $agent_id = bee_ai_agents_prompt_for_agent_id();
@@ -142,8 +165,10 @@ function bee_ai_agents_print_run_result($agent_id, $message, array $options = []
   }
 
   if (!empty($result['status']) && $result['status'] === 'needs_approval') {
-    $tool_name = !empty($result['pending_tool']['name']) ? $result['pending_tool']['name'] : bt('unknown');
-    bee_message(bt('Approval needed for tool: @tool', ['@tool' => $tool_name]), 'warning');
+    $tool_name = !empty($result['pending_tools'])
+      ? ai_agents_pending_tools_summary($result['pending_tools'], bt('unknown'))
+      : (!empty($result['pending_tool']['name']) ? $result['pending_tool']['name'] : bt('unknown'));
+    bee_message(bt('Approval needed for tool(s): @tool — approving runs ALL of them.', ['@tool' => $tool_name]), 'warning');
     if (!empty($result['token'])) {
       bee_message(bt('Resume token: @token', ['@token' => $result['token']]), 'log');
       bee_message(bt('Resume with: bee agent-run @agent_id --resume-token=@token --approved=1', [

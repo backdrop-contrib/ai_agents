@@ -437,7 +437,9 @@ function ai_agents_explorer_form($form, &$form_state) {
     }
 
     if (!empty($result['status']) && $result['status'] === 'needs_approval') {
-      $tool_name = !empty($result['pending_tool']['name']) ? $result['pending_tool']['name'] : t('a write tool');
+      $tool_name = !empty($result['pending_tools'])
+        ? ai_agents_pending_tools_summary($result['pending_tools'], t('a write tool'))
+        : (!empty($result['pending_tool']['name']) ? $result['pending_tool']['name'] : t('a write tool'));
       $form['results']['approval_notice'] = [
         '#markup' => '<div class="messages warning">'
           . t('The agent paused before executing <strong>@tool</strong> because it requires approval. The Explorer is read-only — no changes were made to the site. To execute write operations, use the Assistant interface.', ['@tool' => check_plain($tool_name)])
