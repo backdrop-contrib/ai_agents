@@ -740,7 +740,7 @@ function ai_agents_pending_tools_summary(array $pending_tools, $fallback = '') {
       $names[] = (string) $tool['name'];
     }
   }
-  $names = array_values(array_unique($names));
+  $names = array_values($names);
   return !empty($names) ? implode(', ', $names) : (string) $fallback;
 }
 

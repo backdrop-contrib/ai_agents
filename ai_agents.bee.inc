@@ -73,12 +73,18 @@ function bee_ai_agents_run($arguments = [], $options = []) {
 
   // Map hyphenated bee options to the keys ai_agents_run() expects.
   if (!empty($options['resume-token'])) {
-    $options['resume_token'] = (string) $options['resume-token'];
-    $options['approved'] = !empty($options['approved']);
+    $resume_options = [];
+    $resume_options['resume_token'] = (string) $options['resume-token'];
+    // Strictly compare so string 'false' or '0' are not treated as approved.
+    $approved_raw = $options['approved'] ?? FALSE;
+    $resume_options['approved'] = ($approved_raw === TRUE || $approved_raw === 1 || $approved_raw === '1');
     // Resuming needs no message; don't fall into the interactive loop.
-    bee_ai_agents_print_run_result($agent_id, '', $options);
+    bee_ai_agents_print_run_result($agent_id, '', $resume_options);
     return;
   }
+
+  // Strip resume-only flags so fresh runs never inherit them.
+  unset($options['resume-token'], $options['resume_token'], $options['approved']);
 
   if ($agent_id === '') {
     $agent_id = bee_ai_agents_prompt_for_agent_id();
