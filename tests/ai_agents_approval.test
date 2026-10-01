@@ -8,7 +8,7 @@
 class AIAgentApprovalTestCase extends BackdropWebTestCase {
 
   public function setUp() {
-    parent::setUp(['ai', 'ai_tools', 'ai_agents', 'ai_agents_test']);
+    parent::setUp(['ai', 'ai_tools', 'ai_agents', 'ai_agent_test']);
 
     $providers = config('ai.settings');
     $providers->set('providers', [
@@ -59,6 +59,58 @@ class AIAgentApprovalTestCase extends BackdropWebTestCase {
     ]);
 
     $this->assertTrue(empty($resume['error']), 'Resumed run finished without error.');
-    $this->assertEqual('Final answer: {"channel":"#content-team","message":"Approved: Hello approval"}', $resume['answer'], 'Approved tool resumed with forced params and hook mutation.');
+    $prefix = 'Final answer: ';
+    $this->assertTrue(strpos($resume['answer'], $prefix) === 0, 'Approved tool returned a final answer.');
+    $payload = json_decode(substr($resume['answer'], strlen($prefix)), TRUE);
+    $this->assertTrue(is_array($payload), 'Approved tool returned structured JSON.');
+    $this->assertEqual('#content-team', isset($payload['channel']) ? $payload['channel'] : '', 'Forced channel was applied.');
+    $this->assertEqual('Approved: Hello approval', isset($payload['message']) ? $payload['message'] : '', 'Approval hook mutated the message.');
+  }
+
+  public function testApprovalStateRebuildsProviderToolSchemas() {
+    $agent = [
+      'id' => 'schema_approval_agent',
+      'agent_id' => 'schema_approval_agent',
+      'tools' => ['get_vocabularies'],
+      'tool_settings' => [],
+    ];
+    $tool_definitions = ai_agents_build_tool_definitions($agent);
+    $this->assertTrue(!empty($tool_definitions), 'Taxonomy tool definition is available.');
+    $this->assertTrue($tool_definitions[0]['function']['parameters']['properties'] instanceof stdClass, 'Empty properties map is represented as a JSON object before persistence.');
+
+    $state = [
+      'agent' => $agent,
+      'agent_id' => 'schema_approval_agent',
+      'model' => 'agent_test/gpt-4o-mini',
+      'temperature' => 0.0,
+      'max_tokens' => 128,
+      'messages' => [
+        ['role' => 'user', 'content' => 'List vocabularies.'],
+      ],
+      'trace' => [],
+      'loops' => 0,
+      'max_loops' => 1,
+      'pending_tool_calls' => [
+        [
+          'id' => 'call-vocabularies',
+          'name' => 'get_vocabularies',
+          'arguments' => [],
+        ],
+      ],
+      'pending_tool' => [
+        'name' => 'get_vocabularies',
+        'args' => [],
+      ],
+      'tools' => $tool_definitions,
+    ];
+    $token = ai_agents_store_pending_run($state);
+    $loaded = ai_agents_load_pending_run($token);
+    $this->assertFalse(isset($loaded['tools']), 'Pending state does not persist provider tool schemas.');
+
+    $result = ai_agents_resume_run('schema_approval_agent', [
+      'resume_token' => $token,
+      'approved' => TRUE,
+    ]);
+    $this->assertTrue(empty($result['error']), 'Resumed run rebuilds provider-safe tool schemas.');
   }
 }
