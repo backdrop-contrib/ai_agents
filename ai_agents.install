@@ -61,10 +61,6 @@ function ai_agents_schema() {
  * Implements hook_install().
  */
 function ai_agents_install() {
-  // Import default agent definitions shipped with the module.
-  // Do this before the upgrade migration so defaults are present even on fresh installs.
-  config_install_default_config('module', 'ai_agents');
-
   if (!module_load_install('ai_upgrade')) { return; }
   ai_upgrade_module_install('ai_agent');
 }
@@ -80,16 +76,14 @@ function ai_agents_update_1000() {
 }
 
 /**
- * Rename openai_agents_pending_run table to ai_agents_pending_run.
+ * Move legacy openai_agent_pending_run rows into ai_agents_pending_run.
  */
 function ai_agents_update_1001() {
-  if (db_table_exists('openai_agents_pending_run') && !db_table_exists('ai_agents_pending_run')) {
-    db_rename_table('openai_agents_pending_run', 'ai_agents_pending_run');
+  if (!module_load_install('ai_upgrade')) {
+    return t('AI Upgrade helpers unavailable; legacy pending runs not migrated.');
   }
-  elseif (db_table_exists('openai_agents_pending_run')) {
-    db_drop_table('openai_agents_pending_run');
-  }
-  return t('Renamed openai_agents_pending_run to ai_agents_pending_run.');
+  $result = ai_upgrade_migrate_table('openai_agent_pending_run', 'ai_agents_pending_run', ['token'], !module_exists('openai_agent'));
+  return t('Legacy pending runs: !summary.', ['!summary' => ai_upgrade_table_results_summary([$result])]);
 }
 
 /**
@@ -109,14 +103,30 @@ function ai_agents_update_1003() {
 }
 
 /**
- * Re-migrate openai_agent.settings → ai_agents.settings stripping openai/ prefix.
+ * Superseded by ai_agents_update_1004().
  */
 function ai_agents_update_1002() {
-  if (!module_load_install('ai_upgrade')) { return []; }
-  if (function_exists('_ai_transform_agent_config')) {
-    _ai_migrate_config_object('openai_agent.settings', 'ai_agents.settings', '_ai_transform_agent_config', TRUE);
+  return t('Superseded by update 1004.');
+}
+
+/**
+ * Qualify unprefixed agent models as openai/<model>.
+ *
+ * The legacy suite sent unprefixed models to OpenAI; the AI suite sends them
+ * to the first enabled provider. The admin UI always saves prefixed IDs, so
+ * unprefixed values can only come from migrated legacy config.
+ */
+function ai_agents_update_1004() {
+  if (!module_load_install('ai_upgrade')) {
+    return t('AI Upgrade helpers unavailable; agent models not checked.');
   }
-  return t('Re-migrated agent config: stripped openai/ provider prefix from model fields.');
+  $config = config('ai_agents.settings');
+  $agents = $config->get('agents');
+  $changed = is_array($agents) ? _ai_upgrade_qualify_item_models($agents) : 0;
+  if ($changed) {
+    $config->set('agents', $agents)->save();
+  }
+  return t('Qualified @count unprefixed agent model(s) with the openai/ provider prefix.', ['@count' => $changed]);
 }
 
 /**

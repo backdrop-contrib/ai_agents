@@ -168,7 +168,15 @@ function bee_ai_agents_print_run_result($agent_id, $message, array $options = []
     $tool_name = !empty($result['pending_tools'])
       ? ai_agents_pending_tools_summary($result['pending_tools'], bt('unknown'))
       : (!empty($result['pending_tool']['name']) ? $result['pending_tool']['name'] : bt('unknown'));
-    bee_message(bt('Approval needed for tool(s): @tool — approving runs ALL of them.', ['@tool' => $tool_name]), 'warning');
+    bee_message(bt('Approval needed for tool(s): @tool — approving runs ALL of them. Nothing has been changed yet.', ['@tool' => $tool_name]), 'warning');
+    // Show each action with its arguments so the approver can check them.
+    foreach ((!empty($result['pending_tools']) ? $result['pending_tools'] : []) as $pending_call) {
+      $lines = [];
+      foreach ((!empty($pending_call['args']) && is_array($pending_call['args']) ? $pending_call['args'] : []) as $key => $value) {
+        $lines[] = '    ' . $key . ': ' . truncate_utf8(is_scalar($value) ? (string) $value : json_encode($value, JSON_UNESCAPED_SLASHES), 200, FALSE, TRUE);
+      }
+      bee_message('  ' . $pending_call['name'] . ($lines ? "\n" . implode("\n", $lines) : ''), 'log');
+    }
     if (!empty($result['token'])) {
       bee_message(bt('Resume token: @token', ['@token' => $result['token']]), 'log');
       bee_message(bt('Resume with: bee agent-run @agent_id --resume-token=@token --approved=1', [

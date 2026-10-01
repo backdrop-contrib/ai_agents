@@ -8,7 +8,7 @@
 class AIAgentOrchestrationTestCase extends BackdropWebTestCase {
 
   public function setUp() {
-    parent::setUp(['ai', 'ai_tools', 'ai_agents', 'ai_agents_test']);
+    parent::setUp(['ai', 'ai_tools', 'ai_agents', 'ai_agent_test']);
 
     $providers = config('ai.settings');
     $providers->set('providers', [

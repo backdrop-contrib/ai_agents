@@ -177,6 +177,15 @@ function ai_agents_resume_run($agent_id, array $options = []) {
     ];
   }
 
+  // Tool definitions are derived from the agent configuration. Rebuild them
+  // after loading the approval state instead of trusting a serialized copy.
+  // In particular, empty JSON-object maps are represented by stdClass in the
+  // live schema; unserialize() with allowed_classes=FALSE turns those into
+  // __PHP_Incomplete_Class values that corrupt provider payloads.
+  if (!empty($state['agent']) && is_array($state['agent'])) {
+    $state['tools'] = ai_agents_build_tool_definitions($state['agent']);
+  }
+
   ai_agents_clear_pending_run($resume_token);
   $api_state = ai_agents_prepare_model_api(isset($state['model']) ? (string) $state['model'] : '');
   if (!empty($api_state['error'])) {
@@ -490,7 +499,7 @@ function ai_agents_continue_sync(array $state) {
       $messages = $processed_tools['messages'];
     }
   }
-  catch (\Exception $e) {
+  catch (\Throwable $e) {
     $error_message = $e->getMessage();
     if (function_exists('ai_exception_user_message')) {
       $error_message = ai_exception_user_message($e, $error_message);
@@ -685,12 +694,15 @@ function ai_agents_dispatch_tool(array $agent, $tool_name, array $tool_args) {
  * Determines whether a tool requires approval.
  */
 function ai_agents_tool_requires_approval(array $tool) {
-  $operation = !empty($tool['operation']) ? (string) $tool['operation'] : 'read';
-  if (in_array($operation, ['write', 'trigger'], TRUE)) {
+  if (!empty($tool['destructive'])) {
     return TRUE;
   }
 
-  return !empty($tool['destructive']);
+  // Fail closed: only operations known to be safe skip approval. A missing
+  // or unrecognized value (a typo, or a new kind of operation) needs a human.
+  // 'propose' tools only queue a proposal that a person reviews later.
+  $operation = !empty($tool['operation']) ? (string) $tool['operation'] : '';
+  return !in_array($operation, ['read', 'propose'], TRUE);
 }
 
 /**
@@ -745,12 +757,91 @@ function ai_agents_pending_tools_summary(array $pending_tools, $fallback = '') {
 }
 
 /**
+ * Describes pending tool calls in plain language for an approval prompt.
+ *
+ * The person approving needs to see what will change, not a machine name:
+ * this is the last check before a possibly misled model acts.
+ *
+ * @param array $pending_tools
+ *   Pending calls as returned by ai_agents_get_approval_required_tools(),
+ *   each with 'name' and 'args'.
+ *
+ * @return array
+ *   A render array listing each action with its details. All model-supplied
+ *   text is escaped.
+ */
+function ai_agents_describe_pending_tools(array $pending_tools) {
+  $registry = function_exists('ai_tools_get_tools') ? ai_tools_get_tools() : [];
+  $items = [];
+  foreach ($pending_tools as $call) {
+    $name = !empty($call['name']) ? (string) $call['name'] : '';
+    if ($name === '') {
+      continue;
+    }
+    $tool = $registry[$name] ?? [];
+
+    // "modify_taxonomy_term" becomes "Modify taxonomy term".
+    $title = ucfirst(str_replace('_', ' ', $name));
+    $description = (string) ($tool['definition']['function']['description'] ?? '');
+    // The first sentence of the tool description is enough context.
+    if (preg_match('/^(.+?[.!?])(\s|$)/s', $description, $m)) {
+      $description = $m[1];
+    }
+
+    $details = [];
+    $args = !empty($call['args']) && is_array($call['args']) ? $call['args'] : [];
+    foreach ($args as $key => $value) {
+      if (is_array($value) || is_object($value)) {
+        $value = json_encode($value, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+      }
+      elseif (is_bool($value)) {
+        $value = $value ? t('yes') : t('no');
+      }
+      $value = truncate_utf8((string) $value, 200, FALSE, TRUE);
+      $labels = [
+        'nid' => t('Content ID'),
+        'fid' => t('File ID'),
+        'tid' => t('Term ID'),
+        'vid' => t('Vocabulary'),
+        'uid' => t('User ID'),
+        'sid' => t('Submission ID'),
+        'cid' => t('Component ID'),
+      ];
+      $label = $labels[$key] ?? ucfirst(str_replace('_', ' ', (string) $key));
+      $details[] = check_plain($label) . ': <strong>' . check_plain($value) . '</strong>';
+    }
+
+    $text = '<strong>' . check_plain($title) . '</strong>';
+    if ($description !== '') {
+      $text .= ' — ' . check_plain($description);
+    }
+    if (!empty($tool['destructive'])) {
+      $text .= ' <em>' . t('This cannot easily be undone.') . '</em>';
+    }
+    $item = ['data' => $text];
+    if ($details) {
+      $item['children'] = $details;
+    }
+    $items[] = $item;
+  }
+
+  return [
+    '#theme' => 'item_list',
+    '#items' => $items,
+    '#attributes' => ['class' => ['ai-agents-pending-actions']],
+  ];
+}
+
+/**
  * Store a paused run in cache.
  */
 function ai_agents_store_pending_run(array $state) {
   $token = backdrop_random_key(16);
   $cache_state = $state;
   unset($cache_state['api']);
+  // Tool definitions are runtime provider payloads and must not cross the
+  // serialize/unserialize boundary. They are rebuilt from the agent on resume.
+  unset($cache_state['tools']);
   $cache_state['resume_token'] = $token;
   db_merge('ai_agents_pending_run')
     ->key(['token' => $token])
@@ -810,21 +901,19 @@ function ai_agents_clear_pending_run($token) {
  * Resolve a default model.
  */
 function ai_agents_default_model() {
-  $configured = trim((string) config_get('ai.settings', 'default_text_model'));
+  $configured = trim((string) config_get('ai.settings', 'default_tool_calling_model'));
+  if ($configured === '') {
+    $configured = trim((string) config_get('ai.settings', 'default_text_model'));
+  }
   if ($configured !== '') {
     return $configured;
   }
 
-  $models = function_exists('ai_get_all_chat_models') ? ai_get_all_chat_models() : [];
-  foreach ($models as $group) {
-    if (!is_array($group) || empty($group)) {
-      continue;
-    }
-    reset($group);
-    return key($group);
+  $models = function_exists('ai_get_all_tool_calling_models') ? ai_get_all_tool_calling_models() : [];
+  if (empty($models) && function_exists('ai_get_all_chat_models')) {
+    $models = ai_get_all_chat_models();
   }
-
-  return '';
+  return function_exists('ai_default_model') ? ai_default_model($models) : '';
 }
 
 // ---------------------------------------------------------------------------
@@ -904,6 +993,18 @@ function _ai_agents_as_tool_executor(array $args) {
 
   if (!empty($result['error'])) {
     return json_encode(['error' => $result['error']]);
+  }
+
+  // The sub-agent paused on a tool that needs human approval. Nothing was
+  // executed, and a nested run cannot surface its own approval prompt, so
+  // say so plainly instead of returning an empty answer the calling agent
+  // could mistake for success.
+  if (($result['status'] ?? '') === 'needs_approval') {
+    return json_encode([
+      'status' => 'not_executed',
+      'reason' => 'The ' . $agent_id . ' agent needs human approval for these actions, which a nested agent call cannot request. No changes were made. Tell the user, or run that agent directly so they can approve.',
+      'actions_needing_approval' => array_column($result['pending_tools'] ?? [], 'name'),
+    ]);
   }
 
   return (string) ($result['answer'] ?? '');
