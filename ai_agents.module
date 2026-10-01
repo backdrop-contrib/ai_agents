@@ -462,11 +462,16 @@ function ai_agents_continue_sync(array $state) {
         break;
       }
 
-      $messages[] = [
+      $assistant_message = [
         'role' => 'assistant',
         'content' => $response['content'],
         'tool_calls' => ai_agents_normalize_tool_calls($response['tool_calls']),
       ];
+      // Thinking models reject a tool-loop turn that drops their reasoning.
+      if (!empty($response['reasoning_content'])) {
+        $assistant_message['reasoning_content'] = $response['reasoning_content'];
+      }
+      $messages[] = $assistant_message;
 
       $pending_tools = ai_agents_get_approval_required_tools($state['agent'], $response['tool_calls']);
       if (!empty($pending_tools) && empty($state['approved'])) {
@@ -570,7 +575,7 @@ function ai_agents_process_tool_calls(array $agent, array $tool_calls, array $tr
 function ai_agents_normalize_tool_calls(array $tool_calls) {
   $normalized = [];
   foreach ($tool_calls as $tool_call) {
-    $normalized[] = [
+    $call = [
       'id' => isset($tool_call['id']) ? $tool_call['id'] : '',
       'type' => 'function',
       'function' => [
@@ -578,6 +583,12 @@ function ai_agents_normalize_tool_calls(array $tool_calls) {
         'arguments' => json_encode(isset($tool_call['arguments']) ? $tool_call['arguments'] : []),
       ],
     ];
+    // Some thinking models (via Perplexity's Agent API) reject a replayed
+    // call that has lost its signature.
+    if (!empty($tool_call['thought_signature'])) {
+      $call['thought_signature'] = $tool_call['thought_signature'];
+    }
+    $normalized[] = $call;
   }
   return $normalized;
 }
