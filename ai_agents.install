@@ -130,31 +130,6 @@ function ai_agents_update_1004() {
 }
 
 /**
- * Add default agents shipped since update 1003 (node, paragraph, RAG, menu,
- * and layout agents).
- *
- * Only agents missing from the site are added; existing agents, including
- * customized ones with the same ID, are left unchanged.
- */
-function ai_agents_update_1005() {
-  $config = config('ai_agents.settings');
-  $existing = $config->get('agents');
-  $existing = is_array($existing) ? $existing : [];
-  $module_path = backdrop_get_path('module', 'ai_agents');
-  $defaults = json_decode(file_get_contents($module_path . '/config/ai_agents.settings.json'), TRUE);
-  $default_agents = isset($defaults['agents']) ? $defaults['agents'] : [];
-
-  $added = array_diff_key($default_agents, $existing);
-  if ($added) {
-    $config->set('agents', $existing + $added)->save();
-  }
-  return t('Added @count default agent definition(s): @ids.', [
-    '@count' => count($added),
-    '@ids' => $added ? implode(', ', array_keys($added)) : t('none'),
-  ]);
-}
-
-/**
  * Implements hook_requirements().
  */
 function ai_agents_requirements($phase) {
