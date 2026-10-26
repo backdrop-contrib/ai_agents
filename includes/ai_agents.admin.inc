@@ -27,7 +27,7 @@ function ai_agents_admin_list_form($form, &$form_state) {
       $rows[] = [
         check_plain($id),
         check_plain(isset($agent['label']) ? $agent['label'] : $id),
-        check_plain(isset($agent['model']) ? $agent['model'] : ''),
+        check_plain(!empty($agent['model']) ? $agent['model'] : t('Site default')),
         check_plain(implode(', ', array_values(array_filter(isset($agent['tools']) ? $agent['tools'] : [])))),
         l(t('Edit'), 'admin/config/ai/ai-agents/' . $id . '/edit') . ' | ' . l(t('Delete'), 'admin/config/ai/ai-agents/' . $id . '/delete'),
       ];
@@ -116,9 +116,8 @@ function ai_agents_admin_edit_form($form, &$form_state, $agent_id = '') {
   $form['model'] = [
     '#type' => 'select',
     '#title' => t('Model'),
-    '#options' => ai_get_all_chat_models(),
-    '#default_value' => isset($agent['model']) ? $agent['model'] : ai_agents_default_model(),
-    '#required' => TRUE,
+    '#options' => ai_model_options_with_default(ai_get_all_chat_models(), 'tool_calling'),
+    '#default_value' => isset($agent['model']) ? $agent['model'] : '',
   ];
 
   $form['temperature'] = [
