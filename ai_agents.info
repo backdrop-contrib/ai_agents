@@ -1,6 +1,7 @@
 name = AI Agents
 description = Config-driven agent runner for AI tools and chatWithTools loops.
 backdrop = 1.x
+php = 8.2
 type = module
 package = AI
 dependencies[] = ai
