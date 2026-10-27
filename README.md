@@ -4,6 +4,7 @@ Config-driven agent runner for the Backdrop CMS AI module. Enables defining agen
 
 ## Requirements
 
+- PHP 8.2 or later
 - `ai` module
 - `ai_tools` module
 
