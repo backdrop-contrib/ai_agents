@@ -1,6 +1,8 @@
 # AI Agents
 
-Config-driven agent runner for the Backdrop CMS AI module. Enables defining agents with system prompts and tool access, then running them in chatWithTools loops via code or Bee CLI.
+Configure an AI agent with instructions, a model, and the tools it can use.
+Run it in the Agents Explorer, through Bee, or in code. The runner uses
+`chatWithTools` loops to send tool results back to the model.
 
 ## Requirements
 
@@ -15,8 +17,13 @@ Config-driven agent runner for the Backdrop CMS AI module. Enables defining agen
 ## Configuration
 
 1. Go to **Administration > Configuration > AI > AI Agents** (`admin/config/ai/ai-agents`).
-2. Add an agent configuration with a name, system prompt, provider/model selection, and allowed tools.
+2. Add an agent with a name, system prompt, model, and enabled tools.
+   Choose a model that supports tool calling if the agent uses tools.
 3. Use the Bee CLI or call `ai_agents_run()` to invoke an agent by machine name.
+
+## Documentation
+
+Find setup, examples, and troubleshooting in the [project wiki](https://github.com/backdrop-contrib/ai_agents/wiki).
 
 ## Issues
 
